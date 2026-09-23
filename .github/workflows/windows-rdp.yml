@@ -1,4 +1,4 @@
-name: Windows Cloud RDPS
+name: SINUX
 
 on:
   workflow_dispatch:
