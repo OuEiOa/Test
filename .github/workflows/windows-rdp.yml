@@ -3,15 +3,12 @@ name: SINUX
 on:
   workflow_dispatch:
 
-# حداقل دسترسی لازم برای Workflow
 permissions:
   contents: read
 
 jobs:
   build:
     runs-on: windows-latest
-
-    # GitHub-hosted runner حداکثر 6 ساعت برای این Job
     timeout-minutes: 360
 
     steps:
@@ -24,14 +21,14 @@ jobs:
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
 
-          # Keep Network Level Authentication enabled
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
 
           Set-Service -Name 'TermService' -StartupType Automatic
           Start-Service -Name 'TermService'
 
+
       # ==================================================
-      # 2. Create RDP Administrator
+      # 2. Create RDP User
       # ==================================================
       - name: Create RDP User
         shell: powershell
@@ -59,9 +56,8 @@ jobs:
           }
 
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
-
-          # Administrator privileges
           Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
 
       # ==================================================
       # 3. Install Tailscale
@@ -78,14 +74,15 @@ jobs:
             throw 'Tailscale installer was not downloaded.'
           }
 
-          $Process = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i "$Installer" /quiet /norestart" -Wait -PassThru
+          $Process = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $Installer, '/quiet', '/norestart') -Wait -PassThru
 
           if ($Process.ExitCode -ne 0) {
             throw "Tailscale installation failed with exit code $($Process.ExitCode)."
           }
 
+
       # ==================================================
-      # 4. Connect to Tailscale
+      # 4. Connect Tailscale
       # ==================================================
       - name: Connect Tailscale
         shell: powershell
@@ -109,18 +106,18 @@ jobs:
           }
 
           Start-Sleep -Seconds 5
-	
+
+
       # ==================================================
       # 5. Allow RDP ONLY through Tailscale
       # ==================================================
       - name: Restrict RDP To Tailscale
         shell: powershell
         run: |
-          # Remove the broad Windows RDP firewall rules
           Disable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-          # Allow TCP 3389 only from Tailscale IPv4 range
           New-NetFirewallRule -DisplayName 'RDP - Tailscale Only' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -RemoteAddress '100.64.0.0/10' -Profile Any
+
 
       # ==================================================
       # 6. Get Tailscale IP
@@ -150,8 +147,9 @@ jobs:
           Write-Host ''
           Write-Host "Connect to: $TailscaleIP"
 
+
       # ==================================================
-      # 7. Keep the runner alive
+      # 7. Keep Runner Alive
       # ==================================================
       - name: Keep Server Alive
         shell: powershell
