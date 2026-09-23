@@ -3,7 +3,7 @@ name: Windows Cloud RDP
 on:
   workflow_dispatch:
 
-# حداقل permission لازم
+# حداقل دسترسی لازم برای Workflow
 permissions:
   contents: read
 
@@ -11,36 +11,28 @@ jobs:
   build:
     runs-on: windows-latest
 
-    # حداکثر زمان این Job
+    # GitHub-hosted runner حداکثر 6 ساعت برای این Job
     timeout-minutes: 360
 
     steps:
 
-      # --------------------------------------------------
-      # 1. Enable RDP securely
-      # --------------------------------------------------
+      # ==================================================
+      # 1. Enable Remote Desktop
+      # ==================================================
       - name: Enable Remote Desktop
         shell: powershell
         run: |
-          # Enable RDP
-          Set-ItemProperty 
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' 
-            -Name 'fDenyTSConnections' 
-            -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
 
-          # KEEP NLA ENABLED
-          Set-ItemProperty 
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 
-            -Name 'UserAuthentication' 
-            -Value 1
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
 
-          # Enable RDP service
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service TermService
+          Set-Service -Name 'TermService' -StartupType Automatic
+          Start-Service -Name 'TermService'
 
-      # --------------------------------------------------
-      # 2. Create private RDP user
-      # --------------------------------------------------
+      # ==================================================
+      # 2. Create RDP Administrator
+      # ==================================================
       - name: Create RDP User
         shell: powershell
         env:
@@ -55,117 +47,116 @@ jobs:
             throw "RDP_PASSWORD secret is missing."
           }
 
-          $Password = ConvertTo-SecureString 
-            $env:RDP_PASSWORD 
-            -AsPlainText 
-            -Force
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
 
-          # Create user
-          New-LocalUser 
-            -Name $env:RDP_USERNAME 
-            -Password $Password 
-            -PasswordNeverExpires:$false 
-            -AccountNeverExpires 
-            -UserMayNotChangePassword:$false 
-            -ErrorAction Stop
+          $ExistingUser = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
 
-          # Add to Remote Desktop Users
-          Add-LocalGroupMember 
-            -Group "Remote Desktop Users" 
-            -Member $env:RDP_USERNAME 
-            -ErrorAction Stop
+          if ($null -eq $ExistingUser) {
+            New-LocalUser -Name $env:RDP_USERNAME -Password $Password -AccountNeverExpires -ErrorAction Stop
+          }
+          else {
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $Password
+          }
 
-          # Add administrator privileges only if you actually need them
-          Add-LocalGroupMember 
-            -Group "Administrators" 
-            -Member $env:RDP_USERNAME 
-            -ErrorAction Stop
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
 
-      # --------------------------------------------------
+          # Administrator privileges
+          Add-LocalGroupMember -Group 'Administrators' -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+      # ==================================================
       # 3. Install Tailscale
-      # --------------------------------------------------
+      # ==================================================
       - name: Install Tailscale
         shell: powershell
         run: |
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
+          $TailscaleUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+          $Installer = Join-Path $env:TEMP 'tailscale.msi'
 
-          Invoke-WebRequest 
-            -Uri $url 
-            -OutFile $installer
+          Invoke-WebRequest -Uri $TailscaleUrl -OutFile $Installer -UseBasicParsing
 
-          Start-Process 
-            -FilePath "msiexec.exe" 
-            -ArgumentList "/i "$installer" /quiet /norestart" 
-            -Wait 
-            -NoNewWindow
+          if (-not (Test-Path $Installer)) {
+            throw 'Tailscale installer was not downloaded.'
+          }
 
-      # --------------------------------------------------
+          $Process = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i "$Installer" /quiet /norestart" -Wait -PassThru
+
+          if ($Process.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($Process.ExitCode)."
+          }
+
+      # ==================================================
       # 4. Connect to Tailscale
-      # --------------------------------------------------
+      # ==================================================
       - name: Connect Tailscale
         shell: powershell
         env:
-          TAILSCALE_EPHEMERAL_AUTH_KEY: ${{ secrets.TAILSCALE_EPHEMERAL_AUTH_KEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_EPHEMERAL_AUTH_KEY)) {
-            throw "TAILSCALE_EPHEMERAL_AUTH_KEY secret is missing."
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY secret is missing."
           }
 
-          & "C:\Program Files\Tailscale\tailscale.exe" up 
-            --authkey="$env:TAILSCALE_EPHEMERAL_AUTH_KEY" 
-            --hostname="github-rdp-$env:GITHUB_RUN_ID"
+          $TailscaleExe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          if (-not (Test-Path $TailscaleExe)) {
+            throw 'Tailscale executable was not found.'
+          }
+
+          & $TailscaleExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed with exit code $LASTEXITCODE."
+          }
 
           Start-Sleep -Seconds 5
-
-      # --------------------------------------------------
-      # 5. Restrict RDP firewall to Tailscale
-      # --------------------------------------------------
+	
+      # ==================================================
+      # 5. Allow RDP ONLY through Tailscale
+      # ==================================================
       - name: Restrict RDP To Tailscale
         shell: powershell
         run: |
-          # Disable the broad built-in RDP firewall rules
-          Disable-NetFirewallRule 
-            -DisplayGroup "Remote Desktop"# Allow RDP only from Tailscale's CGNAT range
-          New-NetFirewallRule 
-            -DisplayName "RDP - Tailscale Only" 
-            -Direction Inbound 
-            -Protocol TCP 
-            -LocalPort 3389 
-            -Action Allow 
-            -RemoteAddress "100.64.0.0/10" `
-            -Profile Any
+          # Remove the broad Windows RDP firewall rules
+          Disable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-      # --------------------------------------------------
+          # Allow TCP 3389 only from Tailscale IPv4 range
+          New-NetFirewallRule -DisplayName 'RDP - Tailscale Only' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -RemoteAddress '100.64.0.0/10' -Profile Any
+
+      # ==================================================
       # 6. Get Tailscale IP
-      # --------------------------------------------------
+      # ==================================================
       - name: Show Connection Information
         shell: powershell
-        run: |
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "       WINDOWS RDP IS READY"
-          Write-Host "=============================================="
-          Write-Host "Tailscale IP:"
-          Write-Host $ts_ip
-          Write-Host ""
-          Write-Host "Username:"
-          Write-Host $env:RDP_USERNAME
-          Write-Host ""
-          Write-Host "Password: stored in GitHub Secret"
-          Write-Host "=============================================="
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+        run: |
+          $TailscaleExe = 'C:\Program Files\Tailscale\tailscale.exe'
 
-      # --------------------------------------------------
-      # 7. Keep runner alive
-      # --------------------------------------------------
+          $TailscaleIP = (& $TailscaleExe ip -4 | Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($TailscaleIP)) {
+            throw 'Could not obtain Tailscale IPv4 address.'
+          }
+
+          Write-Host ''
+          Write-Host '=============================================='
+          Write-Host '          WINDOWS RDP IS READY'
+          Write-Host '=============================================='
+          Write-Host "Tailscale IP : $TailscaleIP"
+          Write-Host "Username     : $env:RDP_USERNAME"
+          Write-Host 'Password     : stored in GitHub Secret'
+          Write-Host 'RDP Port     : 3389'
+          Write-Host '=============================================='
+          Write-Host ''
+          Write-Host "Connect to: $TailscaleIP"
+
+      # ==================================================
+      # 7. Keep the runner alive
+      # ==================================================
       - name: Keep Server Alive
         shell: powershell
         run: |
           while ($true) {
             Start-Sleep -Seconds 60
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP server running..."
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP server is running..."
           }
